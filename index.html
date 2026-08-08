@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pinch Writing Pad</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+  #container { position: relative; width: 100vw; height: 100vh; }
+  #video { display: none; }
+  #canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; }
+  #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
+  #toolbar {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 12px; z-index: 20; background: rgba(30,30,30,0.85);
+    padding: 12px 24px; border-radius: 40px; backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    align-items: center;
+  }
+  #toolbar button {
+    border: none; background: rgba(255,255,255,0.12); color: #fff;
+    padding: 10px 20px; border-radius: 24px; font-size: 14px; cursor: pointer;
+    transition: all 0.2s; white-space: nowrap; font-weight: 500;
+  }
+  #toolbar button:hover { background: rgba(255,255,255,0.25); }
+  #toolbar button.active { background: #4A90D9; color: #fff; }
+  #color-picker { width: 40px; height: 40px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.3); cursor: pointer; }
+  #size-slider { width: 100px; accent-color: #4A90D9; }
+  #status {
+    position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+    z-index: 20; color: #fff; font-size: 16px; font-weight: 600;
+    background: rgba(0,0,0,0.6); padding: 8px 20px; border-radius: 20px;
+    transition: opacity 0.3s;
+  }
+  #fps { position: absolute; top: 20px; right: 20px; z-index: 20; color: #0f0; font-size: 13px; font-family: monospace; }
+</style>
+</head>
+<body>
+<div id="container">
+  <video id="video" autoplay playsinline></video>
+  <canvas id="canvas"></canvas>
+  <canvas id="overlay"></canvas>
+  <div id="status">🖐️ Pinch thumb + index finger to write</div>
+  <div id="fps"></div>
+  <div id="toolbar">
+    <button id="fullscreen-btn" title="Fullscreen">⛶ Fullscreen</button>
+    <input type="color" id="color-picker" value="#FFFFFF" title="Pen color">
+    <input type="range" id="size-slider" min="2" max="20" value="5" title="Pen size">
+    <span style="color:#aaa;font-size:14px;" id="size-label">5px</span>
+    <button id="clear-btn">🗑️ Clear</button>
+    <button id="eraser-btn">🧹 Eraser</button>
+    <button id="undo-btn">↩ Undo</button>
+    <button id="camera-btn">📷 Flip Camera</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js" crossorigin="anonymous"></script>
+
+<script>
+// ─── DOM refs ───
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const ovCtx = overlay.getContext('2d');
+const statusEl = document.getElementById('status');
+const fpsEl = document.getElementById('fps');
+const colorPicker = document.getElementById('color-picker');
+const sizeSlider = document.getElementById('size-slider');
+const sizeLabel = document.getElementById('size-label');
+
+// ─── State ───
+let penColor = '#FFFFFF';
+let penSize = 5;
+let isEraser = false;
+let isPinching = false;
+let prevX = null, prevY = null;
+let history = [];
+let maxHistory = 50;
+let facingMode = 'user';
+let hands = null;
+let camera = null;
+let frameCount = 0, lastFpsTime = performance.now();
+
+// ─── Canvas sizing ───
+function resizeCanvas() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  overlay.width = window.innerWidth;
+  overlay.height = window.innerHeight;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// ─── Save history snapshot ───
+function saveState() {
+  history.push(canvas.toDataURL());
+  if (history.length > maxHistory) history.shift();
+}
+
+// ─── Undo ───
+function undo() {
+  if (history.length === 0) return;
+  const img = new Image();
+  img.onload = () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0);
+  };
+  img.src = history.pop();
+}
+
+// ─── Clear ───
+function clearCanvas() {
+  saveState();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+// ─── Draw line ───
+function drawLine(fromX, fromY, toX, toY) {
+  ctx.beginPath();
+  ctx.moveTo(fromX, fromY);
+  ctx.lineTo(toX, toY);
+  ctx.strokeStyle = isEraser ? '#000000' : penColor;
+  ctx.lineWidth = isEraser ? penSize * 4 : penSize;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+}
+
+// ─── Distance between two landmarks ───
+function landmarkDist(lm1, lm2) {
+  const dx = lm1.x - lm2.x;
+  const dy = lm1.y - lm2.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+// ─── Map hand coords to screen coords ───
+function toScreen(lm) {
+  return {
+    x: (1 - lm.x) * canvas.width,   // mirror for selfie camera
+    y: lm.y * canvas.height
+  };
+}
+
+// ─── MediaPipe Hands callback ───
+function onResults(results) {
+  // Draw overlay
+  ovCtx.clearRect(0, 0, overlay.width, overlay.height);
+  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+
+    // Use first hand
+    const lm = results.multiHandLandmarks[0];
+
+    // Draw landmarks
+    drawHandOverlay(lm, ovCtx);
+
+    // Pinch detection: thumb tip (4) vs index finger tip (8)
+    const thumbTip = lm[4];
+    const indexTip = lm[8];
+    const dist = landmarkDist(thumbTip, indexTip);
+
+    const pinchThreshold = 0.05; // tuned for accuracy
+
+    if (dist < pinchThreshold) {
+      // Pinch active
+      if (!isPinching) {
+        isPinching = true;
+        prevX = null; prevY = null;
+        saveState();
+        statusEl.textContent = '✍️ Writing...';
+        statusEl.style.color = '#4A90D9';
+      }
+      const pt = toScreen(indexTip);
+      if (prevX !== null && prevY !== null) {
+        drawLine(prevX, prevY, pt.x, pt.y);
+      }
+      prevX = pt.x;
+      prevY = pt.y;
+    } else {
+      if (isPinching) {
+        isPinching = false;
+        prevX = null; prevY = null;
+        statusEl.textContent = '🖐️ Pinch thumb + index finger to write';
+        statusEl.style.color = '#fff';
+      }
+    }
+  } else {
+    if (isPinching) {
+      isPinching = false;
+      prevX = null; prevY = null;
+      statusEl.textContent = '🖐️ No hand detected — show your hand';
+      statusEl.style.color = '#fff';
+    } else {
+      statusEl.textContent = '🖐️ Pinch thumb + index finger to write';
+      statusEl.style.color = '#fff';
+    }
+  }
+
+  // FPS
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFpsTime >= 1000) {
+    fpsEl.textContent = `${frameCount} FPS`;
+    frameCount = 0;
+    lastFpsTime = now;
+  }
+}
+
+// ─── Draw hand skeleton on overlay ───
+function drawHandOverlay(landmarks, g) {
+  const connections = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [0,9],[9,10],[10,11],[11,12],
+    [0,13],[13,14],[14,15],[15,16],
+    [0,17],[17,18],[18,19],[19,20],
+    [5,9],[9,13],[13,17]
+  ];
+  g.strokeStyle = 'rgba(74, 144, 217, 0.6)';
+  g.lineWidth = 2;
+  for (const [a, b] of connections) {
+    const p1 = toScreen(landmarks[a]);
+    const p2 = toScreen(landmarks[b]);
+    g.beginPath();
+    g.moveTo(p1.x, p1.y);
+    g.lineTo(p2.x, p2.y);
+    g.stroke();
+  }
+  // Draw landmarks
+  for (let i = 0; i < landmarks.length; i++) {
+    const pt = toScreen(landmarks[i]);
+    const r = (i === 4 || i === 8) ? 6 : 3;
+    const color = (i === 4 || i === 8) ? '#FF4444' : 'rgba(255,255,255,0.7)';
+    g.fillStyle = color;
+    g.beginPath();
+    g.arc(pt.x, pt.y, r, 0, 2 * Math.PI);
+    g.fill();
+  }
+  // Pinch indicator
+  const thumbTip = landmarks[4];
+  const indexTip = landmarks[8];
+  const dist = landmarkDist(thumbTip, indexTip);
+  const pinchThreshold = 0.05;
+  const t = toScreen(thumbTip);
+  const i = toScreen(indexTip);
+  g.strokeStyle = dist < pinchThreshold ? '#00FF00' : 'rgba(255,255,255,0.5)';
+  g.lineWidth = dist < pinchThreshold ? 3 : 1;
+  g.beginPath();
+  g.moveTo(t.x, t.y);
+  g.lineTo(i.x, i.y);
+  g.stroke();
+}
+
+// ─── Initialize MediaPipe ───
+function initHands() {
+  hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}`
+  });
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.8,
+    minTrackingConfidence: 0.7
+  });
+  hands.onResults(onResults);
+}
+
+// ─── Start camera ───
+function startCamera() {
+  if (camera) camera.stop();
+  const Camera = window.Camera;
+  camera = new Camera(video, {
+    onFrame: async () => { await hands.send({ image: video }); },
+    width: 640,
+    height: 480,
+    facingMode: facingMode
+  });
+  camera.start().then(() => {
+    statusEl.textContent = '🖐️ Pinch thumb + index finger to write';
+  }).catch(() => {
+    statusEl.textContent = '⚠️ Camera access denied. Please allow camera.';
+  });
+}
+
+// ─── Toolbar events ───
+document.getElementById('fullscreen-btn').addEventListener('click', () => {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    document.documentElement.requestFullscreen();
+  }
+});
+
+document.getElementById('clear-btn').addEventListener('click', clearCanvas);
+document.getElementById('undo-btn').addEventListener('click', undo);
+
+document.getElementById('eraser-btn').addEventListener('click', function() {
+  isEraser = !isEraser;
+  this.classList.toggle('active', isEraser);
+  statusEl.textContent = isEraser ? '🧹 Eraser mode — pinch to erase' : '🖐️ Pinch thumb + index finger to write';
+});
+
+document.getElementById('camera-btn').addEventListener('click', () => {
+  facingMode = facingMode === 'user' ? 'environment' : 'user';
+  startCamera();
+});
+
+colorPicker.addEventListener('input', (e) => { penColor = e.target.value; });
+sizeSlider.addEventListener('input', (e) => {
+  penSize = parseInt(e.target.value);
+  sizeLabel.textContent = penSize + 'px';
+});
+
+// ─── Keyboard shortcuts ───
+document.addEventListener('keydown', (e) => {
+  switch (e.key.toLowerCase()) {
+    case 'f': document.getElementById('fullscreen-btn').click(); break;
+    case 'c': clearCanvas(); break;
+    case 'z': if (e.ctrlKey || e.metaKey) { e.preventDefault(); undo(); } break;
+    case 'e': document.getElementById('eraser-btn').click(); break;
+  }
+});
+
+// ─── Boot ───
+initHands();
+startCamera();
+</script>
+</body>
+</html>
